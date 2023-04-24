@@ -23,8 +23,11 @@ from nav2_msgs.action._navigate_to_pose import NavigateToPose_FeedbackMessage
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import qos_profile_sensor_data
 import random
+import rclpy
 
-wayPoints = {'start' : [-0.005979275796562433, -0.0035854950547218323] , 'goal' : [2.9857943058013916, -0.017940163612365723]}
+#'goal' : [2.9857943058013916, -0.017940163612365723] #goal behind the wall
+
+wayPoints = {'start' : [-0.005979275796562433, -0.0035854950547218323] , 'goal' : [2.552584171295166, -0.13353073596954346]}
 kpang = 1/16
 
 class IntermediateGtG(Node):
@@ -74,7 +77,7 @@ class IntermediateGtG(Node):
         # Intermediate goal sampling constants
         self.N = 10 # Number of random samples to generate
         self.wg = 1
-        self.wscan = 1
+        self.wscan = 10
         self.tempGoal = False # If a temporary goal is being used, want to use this to publish the nav messages correctly after turning
 
 
@@ -88,7 +91,7 @@ class IntermediateGtG(Node):
         v = np.array(wayPoints['goal']) - np.array(wayPoints['start'])
         u = (v) / (np.linalg.norm(v))
         xn = np.array(wayPoints['start']) + self.planning_range*u
-        print(f"The initial calculated waypoints are: {xn}")
+        #print(f"The initial calculated waypoints are: {xn}")
 
         self._navPublisher = self.create_publisher(PoseStamped, '/goal_pose', 1)
         self.poseMsg = PoseStamped()
@@ -105,14 +108,13 @@ class IntermediateGtG(Node):
         self.poseMsg.pose.orientation.y = 0.0
         self.poseMsg.pose.orientation.z = 0.0
         self.poseMsg.pose.orientation.w = 1.0
-       
-        #self.goalTrack = 1
-        
-        time.sleep(2)
+               
+        #rclpy.sleep(2) # Allows the turtlebot to initialize so that the message is picked up by the subscriber
+        time.sleep(2) # Allows the turtlebot to initialize so that the message is picked up by the subscriber
         
         self._navPublisher.publish(self.poseMsg)
         
-        print(f'Supposed to have published, msg: {self.poseMsg}')
+        #print(f'Supposed to have published, msg: {self.poseMsg}')
 
         ######################################################################
         #Initializing update_Odometry values                                 
@@ -135,6 +137,11 @@ class IntermediateGtG(Node):
     # Lidar callback. Determines if random or goal sampling should be done                              
     ######################################################################
     def localLidarVal_callback(self, msg):
+        # The issue with using the cost map is that if I want to add random objects in,
+        # I need to remap the environment in gazebo, otherwise it will go through the object.
+        # However, adding the lidar check in the random sample for points that are not feasible
+        # should help this issue
+
         # Array of all lidar values
         self.lidar_ranges = msg.data     
 
@@ -150,17 +157,21 @@ class IntermediateGtG(Node):
         #
         # Only need to do this once when about to send out the go to goal message
         if self.navToGoal:
-            print("In nav to goal if statement in the lidar")
             # Only need to check lidar distances when finding the next waypoint.
             self.navToGoal = False
 
             # If the average of the center 7 values of the lidar have a greater distance than
             # the planning_range value, the trajectory is considered feasible.
             center_sum = 0
-            for lidar_val in range(26, 33):
+            # for lidar_val in range(26, 33):
+            #     center_sum += self.lidar_ranges[lidar_val]
+
+            # goal_range = center_sum / 7
+
+            for lidar_val in range(29, 32):
                 center_sum += self.lidar_ranges[lidar_val]
 
-            goal_range = center_sum / 7
+            goal_range = center_sum / 3
 
             if goal_range > self.planning_range:
                 print(f"Goal range value is: {goal_range}. Next command is to nav to goal")
@@ -192,8 +203,33 @@ class IntermediateGtG(Node):
     # Generates the next intermediate goal sample waypoint
     ######################################################################
     def generateRandXn(self):
-        # Generate N random samples
-        rand_range_idx = random.sample(range(0,59), self.N)
+        # Now need to add a check that the values being sampled from the lidar are not 
+        # smaller than the lidar range... basically they need to have an inf value.
+        # If they are not inf, then need to remove them from list then do random samples on the list.
+        # Possible that once removing all the non-inf samples, instead need to just do a reward function
+        # based on the euclidean distance to the goal. 
+
+        # Create a list of angles that have a range value within the planning_range
+        inf_ranges = []
+
+        for i in range(len(self.lidar_ranges)):
+            if self.lidar_ranges[i] > self.planning_range:
+                inf_ranges.append(i)
+
+        # Also add a grid based approach so that tracking of unknown areas can be done. Actually,
+        # probably not because the way that the search with the lidar works is you cant tell the surrounding
+        # explored/unexplored space... should be able to do it solely on the lidar value. I think this would
+        # apply in instances where the sensor values are inf and want to see which sensor value hasnt been 
+        # previously explored around it
+
+        # Generate N random samples from the samples that have a range > planning_range
+        # If the number of inf_ranges is smaller than N, set rand_range_idx list to inf_ranges
+        # and calculate the reward function of all samples that have a range > planning_range
+        if len(inf_ranges) < self.N:
+            print("Number of ranges greater than the planning range radius is less than the N specified samples.")
+            rand_range_idx = inf_ranges
+        else:
+            rand_range_idx = random.sample(inf_ranges, self.N)
 
         # The reward matrix is made up of N by 4 columns. The columns have
         # the following values:
@@ -204,7 +240,7 @@ class IntermediateGtG(Node):
         reward_matrix = np.zeros((self.N, 4))
 
         # For each sample, calculate the reward function
-        for i in range(self.N):
+        for i in range(len(rand_range_idx)):
             # First, calulate xn, the x and y coordinates of the lidar angle
             x_scaled = self.planning_range * np.cos(np.radians(rand_range_idx[i]))
             y_scaled = self.planning_range * np.sin(np.radians(rand_range_idx[i]))
@@ -221,8 +257,42 @@ class IntermediateGtG(Node):
 
             euc_dist = self.wg * ((dg - dxn) / (dg))
 
-            # Third, calculate the scan distance
-            exploration = self.wscan * self.lidar_ranges[rand_range_idx[i]]
+            # Third, calculate the scan exploration distances
+            # Take into account the surrounding values of the given lidar angle
+            # This can act as an assumption of the exploration potential
+            lidar_angle = rand_range_idx[i]
+            #print(f"The lidar angle is: {lidar_angle}")
+
+            if lidar_angle == 0:
+                # Track number of ranges that are greater than the planning radius.
+                # This count will be used instead of the range value, because
+                # and inf value can overpower the reward function
+                high_range_count = 0
+                if self.lidar_ranges[i+1] > self.planning_range:
+                    high_range_count+=1
+                if self.lidar_ranges[i+2] > self.planning_range:
+                    high_range_count+=1
+
+                exploration = self.wscan * high_range_count
+            elif lidar_angle == 59:
+                high_range_count = 0
+                if self.lidar_ranges[i-1] > self.planning_range:
+                    high_range_count+=1
+                if self.lidar_ranges[i-2] > self.planning_range:
+                    high_range_count+=1
+
+                exploration = self.wscan * high_range_count
+            else:
+                high_range_count = 0
+                if self.lidar_ranges[i+1] > self.planning_range:
+                    high_range_count+=1
+                if self.lidar_ranges[i-1] > self.planning_range:
+                    high_range_count+=1
+
+                exploration = self.wscan * high_range_count
+
+            print(f"Lidar angle {rand_range_idx[i]}'s euclidean distance: {euc_dist} and exploration value: {exploration}")
+
 
             # Fourth, calculate the total reward function
             reward = exploration + euc_dist
@@ -234,6 +304,9 @@ class IntermediateGtG(Node):
         max_reward_idx = np.argmax(reward_matrix[:,0])
         max_row = reward_matrix[max_reward_idx, :]    
         
+        print(f"The complete reward function matrix: {reward_matrix}")
+        print(f"The row picked: {max_row}")
+
         # Need to use the new points as the temporary goal for turning to face the waypoint
         self.x_way, self.y_way = max_row[1], max_row[2]
 
@@ -256,17 +329,26 @@ class IntermediateGtG(Node):
             self.x_starting = msg.feedback.current_pose.pose.position.x
             self.y_starting = msg.feedback.current_pose.pose.position.y
 
-            #Once the goal is reached, turn to face it again and 
+            # End condition so that the system stops sampling
+            if -0.28 < (self.x_starting - wayPoints['goal'][0]) < 0.28:
+                  if -0.28 < (self.y_starting - wayPoints['goal'][1]) < 0.28:
+                    print("Goal has been reached")
+                    quit()
+                  
+            #Once the goal is reached, turn to face it again
+            self.x_way, self.y_way = wayPoints['goal']
             self.faceGoal = True
+            
             self.evalGoal = False
             
             self.robotLin.linear.x = 0.0
             self.robotAng.angular.z = 0.0
             self._velPublisher.publish(self.robotLin)  
-            self._velPublisher.publish(self.robotAng)          
-            time.sleep(2)
+            self._velPublisher.publish(self.robotAng)     
+            #rclpy.sleep(2)     
+            #time.sleep(3)
  
-        elif ~self.evalGoal:
+        elif not self.evalGoal:
             pass
             #print("At the waypoint, waiting for the next publish statement for a new waypoint")
         else:
@@ -289,7 +371,9 @@ class IntermediateGtG(Node):
             self._velPublisher.publish(self.robotAng) 
 
             # If already at the goal and finished turning towards it
-            if ~self.evalGoal:
+            if not self.evalGoal:
+                #rclpy.sleep(2)
+                #time.sleep(3)
                 # If the robot turned towards a temporary xn goal, command it to the next position
                 if self.tempGoal:
                     print(f"Navigating to the temporary goal position: ({self.x_way},{self.y_way})")
@@ -300,24 +384,21 @@ class IntermediateGtG(Node):
 
                     self.evalGoal = True
                     self.tempGoal = False
-
-                time.sleep(2)
-                self.navToGoal = True
+                else:
+                    print("Making nav to goal true")
+                    self.navToGoal = True
 
     ######################################################################
     # Orients the robot before moving to the next waypoint so that it is 
     # facing it directly
     ######################################################################
     def turnToGoal(self):
-        print('Turning to face the goal...')
-
+        print(f"Turning... x way: {self.x_way}")
         thetaGoalRads = np.arctan((self.y_way - self.y_starting) / (self.x_way - self.x_starting))
         if self.x_way < self.x_starting:
             thetaGoalRads = thetaGoalRads + pi
         thetaCurRads = self.globalAng
         thetaSumRads = thetaGoalRads - thetaCurRads
-
-        print(f"Global angle: {self.globalAng}")
 
         while thetaSumRads <= -pi:
             thetaSumRads = thetaSumRads + 2*pi
